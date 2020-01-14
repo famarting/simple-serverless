@@ -1,0 +1,13 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: serverless-controller-route
+  namespace: serverless-infra
+spec:
+  port:
+    targetPort: http
+  to:
+    kind: Service
+    name: serverless-controller-service
+    weight: 100
+  wildcardPolicy: None

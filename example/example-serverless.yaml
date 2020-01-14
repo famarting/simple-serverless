@@ -1,0 +1,27 @@
+apiVersion: serverless.keetle.io/v1alpha1
+kind: Serverless
+metadata:
+  name: example-serverless
+spec:
+  hostname: reverse-words
+  port: 9999
+  podSpec:
+    containers:
+    - image: quay.io/famargon/quarkus-sample-app
+      imagePullPolicy: Always
+      name: quarkus-app
+      env:
+        - name:  deployment.environment
+          value: kubernetes
+        - name:  service.name
+          value: quarkus-app-kubernetes
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 9999
+          # httpHeaders:
+          # - name: Custom-Header
+          # value: Awesome
+        initialDelaySeconds: 1
+        periodSeconds: 5
+      terminationGracePeriodSeconds: 30

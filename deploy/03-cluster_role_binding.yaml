@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: serverless
+  namespace: serverless-infra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: serverless
+subjects:
+- kind: ServiceAccount
+  name: serverless
+  namespace: serverless-infra

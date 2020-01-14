@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: serverless-controller
+  namespace: serverless-infra
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      name: serverless-controller
+  template:
+    metadata:
+      labels:
+        name: serverless-controller
+    spec:
+      serviceAccountName: serverless
+      containers:
+        - name: serverless-controller
+          image: quay.io/famargon/simple-serverless:latest
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 8080
+            name: http
+          env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: KUBERNETES_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+            
