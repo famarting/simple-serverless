@@ -5,6 +5,8 @@ metadata:
 spec:
   hostname: reverse-words
   port: 9999
+  in-flight-requests: 2
+  scale-to-zero-grace-period: 15s
   podSpec:
     containers:
     - image: quay.io/famargon/quarkus-sample-app
@@ -24,4 +26,13 @@ spec:
           # value: Awesome
         initialDelaySeconds: 1
         periodSeconds: 5
-      terminationGracePeriodSeconds: 30
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9999
+          # httpHeaders:
+          # - name: Custom-Header
+          # value: Awesome
+        initialDelaySeconds: 1
+        periodSeconds: 2
+      terminationGracePeriodSeconds: 15

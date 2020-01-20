@@ -1,18 +1,28 @@
 package io.famargon.k8s.resource;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+
 import io.fabric8.kubernetes.client.CustomResource;
 
 /**
  * Serverless
  */
+@JsonDeserialize
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Serverless extends CustomResource{
+
+    /**
+     *
+     */
+    private static final long serialVersionUID = 1L;
 
     public static final String KIND = "Serverless";
 
-    private ServerlessSpec spec;
-    private ServerlessStatus status;
+    private ServerlessSpec spec = new ServerlessSpec();
+    private ServerlessStatus status = new ServerlessStatus(false);
 
-    public void setSpec(final ServerlessSpec spec) {
+    public void setSpec(ServerlessSpec spec) {
         this.spec = spec;
     }
 
@@ -27,5 +37,5 @@ public class Serverless extends CustomResource{
     public void setStatus(ServerlessStatus status) {
         this.status = status;
     }
-    
+
 }

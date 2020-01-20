@@ -1,6 +1,7 @@
 package io.famargon.k8s;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -9,14 +10,15 @@ import org.slf4j.LoggerFactory;
 import io.fabric8.kubernetes.api.model.OwnerReferenceBuilder;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
+import io.fabric8.kubernetes.api.model.apiextensions.CustomResourceDefinition;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
 import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
-import io.fabric8.kubernetes.client.DefaultKubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.Watcher;
-import io.fabric8.kubernetes.client.dsl.MixedOperation;
+import io.fabric8.kubernetes.client.dsl.NonNamespaceOperation;
 import io.fabric8.kubernetes.client.dsl.Resource;
+import io.fabric8.kubernetes.internal.KubernetesDeserializer;
 import io.famargon.k8s.resource.DoneableServerless;
 import io.famargon.k8s.resource.Serverless;
 import io.famargon.k8s.resource.ServerlessCrd;
@@ -30,19 +32,17 @@ public class ServerlessController implements Watcher<Serverless> {
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass().getName());
 
-    private String namespace = System.getenv("KUBERNETES_NAMESPACE");
+    private String namespace = SimpleServerlessOperator.NAMESPACE;
     private KubernetesClient kubernetesClient;
-    private Map<String, CacheItem> cache;
+    private Map<String, Serverless> cache;
 
-    public ServerlessController(KubernetesClient kubernetesClient, Map<String, CacheItem> cache) {
+    public ServerlessController(KubernetesClient kubernetesClient, Map<String, Serverless> cache) {
         this.kubernetesClient = kubernetesClient;
         this.cache = cache;
     }
 
     public void start() {
-
         getServerlessCrdClient().watch(this);
-
     }
 
     @Override
@@ -65,18 +65,17 @@ public class ServerlessController implements Watcher<Serverless> {
     }
 
     private void handleDeletion(Serverless resource) {
-        logger.info("Handling delete {}", resource.getMetadata().getName());
+        logger.info("Handling delete {} {}", resource.getMetadata().getName(), resource.getStatus());
         String suid = resource.getStatus().getSuid();
         kubernetesClient.apps().deployments().inNamespace(namespace).withLabel("suid", suid).delete();
         kubernetesClient.services().inNamespace(namespace).withLabel("suid", suid).delete();
+        cache.remove(resource.getSpec().getHostname());
     }
 
 
     private void handleCreateOrUpdate(Action action, Serverless resource) {
-        logger.info("Handling resource {} {}", resource.getMetadata().getName(), action);
-
         String suid;
-        if(resource.getStatus() == null) {
+        if(resource.getStatus().getSuid() == null) {
             suid = UUID.randomUUID().toString();
         }else{
             suid = resource.getStatus().getSuid();
@@ -88,15 +87,18 @@ public class ServerlessController implements Watcher<Serverless> {
                 .withNamespace(namespace)
                 .withName(resource.getMetadata().getName() + "-deployment")
                 .addToLabels("suid", suid)
+                .addToLabels("app", "serverless")
                 .endMetadata()
                 .withNewSpec()
                 .withReplicas(0)
                 .withNewSelector()
                 .addToMatchLabels("suid", suid)
+                .addToMatchLabels("app", "serverless")
                 .endSelector()
                 .withNewTemplate()
                 .withNewMetadata()
                 .addToLabels("suid", suid)
+                .addToLabels("app", "serverless")
                 .addToOwnerReferences(new OwnerReferenceBuilder()
                 .withApiVersion(resource.getApiVersion())
                 .withKind(resource.getKind())
@@ -107,11 +109,9 @@ public class ServerlessController implements Watcher<Serverless> {
                 .endTemplate()
                 .endSpec()
                 .build();
-            
+
             Deployment depRes = kubernetesClient.apps().deployments().inNamespace(namespace).create(deployment);
             logger.info("Deployment {} created", depRes.getMetadata().getName());
-        }else{
-            logger.info("Deployment {} already exists", resource.getMetadata().getName() + "-deployment");
         }
 
         if(kubernetesClient.services().inNamespace(namespace).withName(resource.getMetadata().getName()+"-loadbalancer").get() == null){
@@ -121,7 +121,8 @@ public class ServerlessController implements Watcher<Serverless> {
             .addToLabels("suid", suid)
             .endMetadata()
             .withNewSpec()
-            .withType("LoadBalancer")
+//            .withType("LoadBalancer")
+            .withType("ClusterIP")
             .addToSelector("suid", suid)
             .addNewPort()
             .withName("http")
@@ -131,28 +132,28 @@ public class ServerlessController implements Watcher<Serverless> {
             .endSpec()
             .build();
             Service createdService = kubernetesClient.services().inNamespace(namespace).create(loadBalancer);
-            logger.info("Loadbalancer {} created", createdService.getMetadata().getName());
-        }else{
-            logger.info("LoadBalancer {} already exists", resource.getMetadata().getName()+"-loadbalancer");
+            logger.info("Loadbalancer {} created, cluster ip is {}", createdService.getMetadata().getName(), createdService.getSpec().getClusterIP());
         }
 
-        if(resource.getStatus() == null && action == Action.ADDED) {
+        if(resource.getStatus().getSuid() == null) {
 
             ServerlessStatus status = new ServerlessStatus();
             status.setSuid(suid);
             status.setIsReady(true);
-            status.setInternalService(resource.getMetadata().getName()+"-loadbalancer");
+//            status.setInternalService(resource.getMetadata().getName() + "-loadbalancer");
+            String clusterIp = kubernetesClient.services().inNamespace(namespace).withName(resource.getMetadata().getName() + "-loadbalancer")
+                .get().getSpec().getClusterIP();
+            status.setInternalService(clusterIp);
+            status.setDeploymentName(resource.getMetadata().getName() + "-deployment");
             resource.setStatus(status);
 
             getServerlessCrdClient()
-                .inNamespace(resource.getMetadata().getNamespace())
-                .withName(resource.getMetadata().getName())
-                .replace(resource);
+                .createOrReplace(resource);
 
-            cache.put(resource.getSpec().getHostname(), new CacheItem(resource));
+            cache.put(resource.getSpec().getHostname(), resource);
+            logger.info("Serverless with host {} successfully {}", resource.getSpec().getHostname(), action);
         }
 
-        logger.info("Serverless with host {} successfully {}", resource.getSpec().getHostname(), action);
     }
 
     private void handleError(Serverless resource) {
@@ -164,10 +165,30 @@ public class ServerlessController implements Watcher<Serverless> {
         logger.error("Error in serverless controller", cause);
     }
 
-    private MixedOperation<Serverless, ServerlessList, DoneableServerless, Resource<Serverless, DoneableServerless>> getServerlessCrdClient() {
-        return (MixedOperation<Serverless, ServerlessList, DoneableServerless, Resource<Serverless, DoneableServerless>>) kubernetesClient
-                .customResources(ServerlessCrd.serverless(), Serverless.class, ServerlessList.class,
-                        DoneableServerless.class)
-                .inNamespace(namespace);
+    private NonNamespaceOperation<Serverless, ServerlessList, DoneableServerless, Resource<Serverless, DoneableServerless>> crdClient;
+
+    private NonNamespaceOperation<Serverless, ServerlessList, DoneableServerless, Resource<Serverless, DoneableServerless>> getServerlessCrdClient() {
+
+
+        if (crdClient == null) {
+
+            KubernetesDeserializer.registerCustomKind(ServerlessCrd.API_VERSION, Serverless.KIND, Serverless.class);
+
+            Optional<CustomResourceDefinition> crd = kubernetesClient
+                    .customResourceDefinitions().list().getItems().stream()
+                    .filter(c -> ServerlessCrd.CRD_NAME.equals(c.getMetadata().getName()))
+                    .findFirst();
+            if (crd.isEmpty()) {
+                logger.error("CRD not found");
+                System.exit(1);
+            }
+
+            crdClient = kubernetesClient
+                    .customResources(crd.get(), Serverless.class, ServerlessList.class, DoneableServerless.class)
+                    .inNamespace(namespace);
+
+        }
+
+        return crdClient;
     }
 }

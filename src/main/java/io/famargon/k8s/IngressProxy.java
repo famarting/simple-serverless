@@ -1,18 +1,14 @@
 package io.famargon.k8s;
 
-import java.util.Map;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.fabric8.kubernetes.client.KubernetesClient;
 import io.famargon.k8s.resource.Serverless;
-import io.netty.handler.codec.http.HttpResponseStatus;
+import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 
 /**
@@ -22,76 +18,58 @@ public class IngressProxy {
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass().getName());
 
-    private Vertx vertx = Vertx.vertx();
-    private HttpClient client = vertx.createHttpClient(new HttpClientOptions());
-    private Map<String, CacheItem> cache;
-    private KubernetesClient kubernetesClient;
+    private HttpClient client;
+    private String destination;
+    private int port;
 
-    public IngressProxy(KubernetesClient kubernetesClient, Map<String, CacheItem> cache) {
-        this.kubernetesClient = kubernetesClient;
-        this.cache = cache;
+    public IngressProxy(Vertx vertx, Serverless serverless) {
+        this.client = vertx.createHttpClient(new HttpClientOptions());
+        this.destination = serverless.getStatus().getInternalService();
+        this.port = serverless.getSpec().getPort();
     }
 
-    public void startServer() {
-        vertx.createHttpServer(new HttpServerOptions().setPort(8080)).requestHandler(this::proxyRequest)
-                .listen(server -> {
-                    if (server.succeeded()) {
-                        logger.info("Server started");
-                    } else {
-                        logger.error("Error starting server", server.cause());
-                    }
-                });
-    }
-
-    private void proxyRequest(HttpServerRequest req) {
-        logger.info("Request received");
-        String targetHost = req.getHeader("x-host");
-        if (targetHost == null || targetHost.isBlank()) {
-            req.response().setStatusCode(HttpResponseStatus.BAD_REQUEST.code()).end("missing x-host header");
-            return;
-        } else {
-            var cacheItem = cache.get(targetHost);
-            if (cacheItem == null) {
-                req.response().setStatusCode(HttpResponseStatus.BAD_REQUEST.code()).end("Serverless target doesn't exists");
-                return;
-            }
-            if (cacheItem.getPods() == 0) {
-                scale(cacheItem);
-            }
-            doProxy(cacheItem.getServerless().getStatus().getInternalService(), cacheItem.getServerless().getSpec().getPort(), req);
-        }
-    }
-
-    private void scale(CacheItem cacheItem) {
-        logger.info("Scaling deployment");
-        String namespace = cacheItem.getServerless().getMetadata().getNamespace();
-        if (cacheItem.getPods() == 0) {
-            kubernetesClient.apps().deployments()
-                .inNamespace(namespace).withName(cacheItem.getServerless().getMetadata().getName()+ "-deployment")
-                .scale(1);
-        }
-    }
-
-    private void doProxy(String destination, int port, HttpServerRequest req) {
-        logger.info("Proxying request: " + req.uri());
-        HttpClientRequest c_req = client.request(req.method(), port, destination, req.uri(), c_res -> {
-            logger.info("Proxying response: " + c_res.statusCode());
+    @SuppressWarnings("deprecation")
+    public void doProxy(HttpServerRequest req, Handler<Void> beforeCallback, Handler<Void> afterCallback) {
+        beforeCallback.handle(null);
+        HttpClientRequest clientReq = client.request(req.method(), port, destination, req.uri(), clientRes -> {
             req.response().setChunked(true);
-            req.response().setStatusCode(c_res.statusCode());
-            req.response().headers().setAll(c_res.headers());
-            c_res.handler(data -> {
-                logger.info("Proxying response body: " + data.toString("ISO-8859-1"));
+            req.response().setStatusCode(clientRes.statusCode());
+            req.response().headers().setAll(clientRes.headers());
+            clientRes.handler(data -> {
                 req.response().write(data);
             });
-            c_res.endHandler((v) -> req.response().end());
+            clientRes.endHandler((v) -> req.response().end());
+            clientRes.exceptionHandler(e -> {
+               logger.error("Error caught in response of request to serverless", e);
+            });
+            req.response().exceptionHandler(e -> {
+               logger.error("Error caught in response to client", e);
+            });
         });
-        c_req.setChunked(true);
-        c_req.headers().setAll(req.headers());
-        req.handler(data -> {
-            logger.info("Proxying request body " + data.toString("ISO-8859-1"));
-            c_req.write(data);
+        clientReq.setChunked(true);
+        clientReq.headers().setAll(req.headers());
+
+        if (req.isEnded()) {
+            clientReq.end();
+            afterCallback.handle(null);
+        } else {
+            req.handler(data -> {
+                clientReq.write(data);
+            });
+            req.endHandler((v) -> {
+                clientReq.end();
+                afterCallback.handle(null);
+            });
+            clientReq.exceptionHandler(e -> {
+                logger.error("Error caught in request to serverless", e);
+                req.response().setStatusCode(500).putHeader("x-error", e.getMessage()).end();
+            });
+        }
+
+        req.exceptionHandler(e -> {
+           logger.error("Error caught in request from client", e);
         });
-        req.endHandler((v) -> c_req.end());
+
     }
 
 }
