@@ -14,7 +14,7 @@ import io.vertx.core.http.HttpServerRequest;
 /**
  * IngressProxy
  */
-public class IngressProxy {
+public class HttpProxy {
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass().getName());
 
@@ -22,7 +22,7 @@ public class IngressProxy {
     private String destination;
     private int port;
 
-    public IngressProxy(Vertx vertx, Serverless serverless) {
+    public HttpProxy(Vertx vertx, Serverless serverless) {
         this.client = vertx.createHttpClient(new HttpClientOptions());
         this.destination = serverless.getStatus().getInternalService();
         this.port = serverless.getSpec().getPort();

@@ -1,2 +1,2 @@
-# curl -i --header "x-host:reverse-words" http://serverless-controller-route-serverless-infra.127.0.0.1.nip.io/api/reverse?text=palc
-curl -i --header "x-host:reverse-words" http://localhost:8080/api/reverse?text=palc
+curl -i --header "x-host:reverse-words" http://serverless-controller-route-serverless-infra.127.0.0.1.nip.io/api/reverse?text=palc
+# curl -i --header "x-host:reverse-words" http://localhost:8080/api/reverse?text=palc

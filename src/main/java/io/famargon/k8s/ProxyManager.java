@@ -1,20 +1,23 @@
 package io.famargon.k8s;
 
+import static io.famargon.k8s.Utils.parseToSeconds;
+import static io.famargon.k8s.Utils.tail;
+
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.fabric8.kubernetes.client.KubernetesClient;
-import io.famargon.k8s.cache.DeploymentsStatusCache;
+import io.famargon.k8s.cache.DeploymentsCache;
 import io.famargon.k8s.resource.Serverless;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.vertx.core.Future;
@@ -23,24 +26,38 @@ import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 
-public class ProxyManager {
+public class ProxyManager implements ServerlessService {
     private final Logger logger = LoggerFactory.getLogger(this.getClass().getName());
 
     private Vertx vertx;
-    private Map<String, Serverless> cache;
     private KubernetesClient kubernetesClient;
-    private DeploymentsStatusCache deploymentsCache;
+    private DeploymentsCache deploymentsCache;
 
-    private Map<String, Queue<HttpServerRequest>> queues = new ConcurrentHashMap<>();
+    private Map<String, Serverless> cache = new ConcurrentHashMap<>();
+    private Map<String, Queue<ServerlessRequest>> queues = new ConcurrentHashMap<>();
     private Map<String, Worker> workers = new ConcurrentHashMap<>();
-    private Map<String, ReplicasChecker> replicasCheckers = new ConcurrentHashMap<>();
+    private Map<String, Autoscaler> autoscalers = new ConcurrentHashMap<>();
 
-
-    public ProxyManager(KubernetesClient kubernetesClient, Map<String, Serverless> cache, Vertx vertx, DeploymentsStatusCache deploymentsCache) {
+    public ProxyManager(KubernetesClient kubernetesClient, Vertx vertx, DeploymentsCache deploymentsCache) {
         this.kubernetesClient = kubernetesClient;
-        this.cache = cache;
         this.vertx = vertx;
         this.deploymentsCache = deploymentsCache;
+    }
+
+    @Override
+    public void create(Serverless serverless) {
+        cache.put(serverless.getSpec().getHostname(), serverless);
+    }
+
+    @Override
+    public void delete(Serverless serverless) {
+        Autoscaler autoscaler = autoscalers.remove(serverless.getMetadata().getName());
+        if (autoscaler!=null) {
+            autoscaler.stop();
+        }
+        queues.remove(serverless.getMetadata().getName());
+        workers.remove(serverless.getMetadata().getName());
+        cache.remove(serverless.getSpec().getHostname());
     }
 
     public void startServer() {
@@ -66,58 +83,51 @@ public class ProxyManager {
                 return;
             }
             req.pause();
+            ServerlessRequest srequest = new ServerlessRequest(req, serverless);
             scale(serverless);
-            enqueue(serverless, req);
-            checkQueue(serverless);
+            enqueue(srequest);
+            checkQueue(srequest);
         }
-    }
-
-    public void deleteServerless(Serverless serverless) {
-        ReplicasChecker checker = replicasCheckers.remove(serverless.getMetadata().getName());
-        if (checker!=null) {
-            checker.stop();
-        }
-        queues.remove(serverless.getMetadata().getName());
-        workers.remove(serverless.getMetadata().getName());
     }
 
     private void scale(Serverless serverless) {
-        replicasCheckers.computeIfAbsent(serverless.getMetadata().getName(), k -> {
-            return new ReplicasChecker(serverless);
+        autoscalers.computeIfAbsent(serverless.getMetadata().getName(), k -> {
+            return new Autoscaler(serverless);
         }).init();
     }
 
-    private void enqueue(Serverless serverless, HttpServerRequest req) {
-        queues.computeIfAbsent(serverless.getMetadata().getName(), k -> {
-            return new ConcurrentLinkedQueue<HttpServerRequest>();
-        }).offer(req);
+    private void enqueue(ServerlessRequest srequest) {
+        queues.computeIfAbsent(srequest.serverless().getMetadata().getName(), k -> {
+            return new ConcurrentLinkedQueue<ServerlessRequest>();
+        }).offer(srequest);
     }
 
-    private void checkQueue(Serverless serverless) {
-        workers.computeIfAbsent(serverless.getMetadata().getName(), k -> {
-            return new Worker(serverless);
+    private void checkQueue(ServerlessRequest srequest) {
+        workers.computeIfAbsent(srequest.serverless().getMetadata().getName(), k -> {
+            return new Worker(srequest.serverless());
         }).check();
     }
 
     private class Worker {
         private Serverless serverless;
-        private Queue<HttpServerRequest> queue;
-        private ReplicasChecker replicasChecker;
+        private Queue<ServerlessRequest> queue;
+        private Autoscaler replicasChecker;
         private ServerlessStats stats;
-        private IngressProxy proxy;
+        private HttpProxy proxy;
 
         private AtomicBoolean busy = new AtomicBoolean(false);
 
         public Worker(Serverless serverless) {
             this.serverless = serverless;
             this.queue = queues.get(serverless.getMetadata().getName());
-            this.replicasChecker = replicasCheckers.get(serverless.getMetadata().getName());
+            this.replicasChecker = autoscalers.get(serverless.getMetadata().getName());
             this.stats = this.replicasChecker.stats;
-            this.proxy = new IngressProxy(vertx, serverless);
+            this.proxy = new HttpProxy(vertx, serverless);
         }
 
         public void check() {
             if (busy.get()) {
+                logger.info("Worker busy");
                 return;
             }
             busy.set(true);
@@ -137,18 +147,17 @@ public class ProxyManager {
         }
 
         private void consumeQueue() {
-            HttpServerRequest request = queue.poll();
+            ServerlessRequest request = queue.poll();
             while (request!=null) {
-                final HttpServerRequest req = request;
+                final var sreq = request;
                 vertx.runOnContext(e-> {
-                    req.resume();
-                    proxy.doProxy(req,
+                    sreq.request().resume();
+                    proxy.doProxy(sreq.request(),
                             v -> {
-                                stats.setLastRequest(Instant.now());
-                                stats.getInFlightRequests().incrementAndGet();
+                                stats.getConcurrentRequests().incrementAndGet();
                             },
                             v -> {
-                                stats.getInFlightRequests().decrementAndGet();
+                                stats.getConcurrentRequests().decrementAndGet();
                             });
                 });
 
@@ -162,10 +171,12 @@ public class ProxyManager {
         }
 
         private Future<Void> waitUntilIsDeployed() {
+            logger.info("Waiting until serverless is deployed");
             Promise<Void> result = Promise.promise();
             String uuid = deploymentsCache.subscribe(serverless.getStatus().getDeploymentName(), (id, d) -> {
                 Integer r = d.getStatus().getAvailableReplicas();
                 if (r != null && r > 0) {
+                    logger.info("Serverless deployed");
                     deploymentsCache.unsubscribe(serverless.getStatus().getDeploymentName(), id);
                     result.complete();
                 }
@@ -179,68 +190,112 @@ public class ProxyManager {
 
     }
 
-    private class ReplicasChecker {
+    private class Autoscaler {
+
+        //two modes of working stable and panic
+        //4 times every second get in-flight requests to calculate average concurrent requests per second
+        //store the averages calculated for the last 60s (duration of stable window)
+        //every 2s (tick interval) compare with the concurrencyTarget or 2xconcurrencyTarget to determine which working mode is enabled
+        //adjust the size of the deployment using the stable window or the panic window
+        //in panic mode scaling up is the only option
+        //to come back to stable mode a stable window of time has to pass since the last scaling up in panic mode
+        //being in stable mode and after having 0 average of concurrent requests for scale-to-zero-grace-period the deployment is scaled to 0
+
+        private AutoscalerWorkingMode mode = AutoscalerWorkingMode.STABLE;
+
         private Serverless serverless;
         private ServerlessStats stats;
 
-        private long jobId;
-        private AtomicBoolean busy = new AtomicBoolean(false);
+        private List<Long> jobsId;
 
-        public ReplicasChecker(Serverless serverless) {
+        public Autoscaler(Serverless serverless) {
             this.serverless = serverless;
             this.stats = new ServerlessStats(serverless);
-            this.jobId = vertx.setPeriodic(1000, v -> check());
+            this.jobsId = Arrays.asList(
+                    vertx.setPeriodic(250, v -> generateStats()),
+                    vertx.setPeriodic(1000, v -> updateStats()),
+                    vertx.setPeriodic(parseToSeconds(serverless.getSpec().getTickInterval()) * 1000, v -> tick()));
         }
 
         public void init() {
             if (stats.getDesiredReplicas().compareAndSet(0, 1)) {
+                stats.setLastScaling(Instant.now());
                 scale(1);
+                mode = AutoscalerWorkingMode.PANIC;
+                logger.info("Starting in {} mode", mode);
             }
-            stats.setLastRequest(Instant.now());
         }
 
-        public void check() {
-            if (busy.get()) {
-                return;
+        private void tick() {
+            var now = Instant.now();
+            double concurrencyTarget = serverless.getSpec().getConcurrencyTarget();
+            double stableWindowAverageConcurrency = stats.getConcurrencyValues().stream().mapToDouble(v->v).average().orElse(0);
+            double panicWindowAverageConcurrency = tail(stats.getConcurrencyValues(), parseToSeconds(serverless.getSpec().getPanicWindow()))
+                    .stream().mapToDouble(v->v).average().orElse(0);
+
+            if (mode == AutoscalerWorkingMode.STABLE) {
+                if (concurrencyTarget*2 <= panicWindowAverageConcurrency) {
+                    mode = AutoscalerWorkingMode.PANIC;
+                    logger.info("Switching to {} mode", mode);
+                    logger.info("Stable window concurrency {} Panic window concurrency {}", stableWindowAverageConcurrency, panicWindowAverageConcurrency);
+                }
+            } else {
+                if (ChronoUnit.SECONDS.between(stats.getLastScaling(), now) >= parseToSeconds(serverless.getSpec().getStableWindow())) {
+                    mode = AutoscalerWorkingMode.STABLE;
+                    logger.info("Switching to {} mode", mode);
+                    logger.info("Stable window concurrency {} Panic window concurrency {}", stableWindowAverageConcurrency, panicWindowAverageConcurrency);
+                }
             }
-            busy.set(true);
 
-            checkReplicas();
-
-            busy.set(false);
-        }
-
-        private void checkReplicas() {
-            int totalInFlightRequests = stats.getInFlightRequests().get();
-            if (totalInFlightRequests>0 && totalInFlightRequests>=serverless.getSpec().getInFlightRequestsPerPod()) {
-                int requiredPods = totalInFlightRequests / serverless.getSpec().getInFlightRequestsPerPod();
+            if (mode == AutoscalerWorkingMode.PANIC) {
+                int desiredPods = (int) Math.ceil(panicWindowAverageConcurrency / concurrencyTarget);
                 int currentPods = stats.getDesiredReplicas().get();
-                if (currentPods != requiredPods) {
-                    int availablePods = deploymentsCache.getAvailablePods(serverless.getStatus().getDeploymentName());
-                    if (stats.getDesiredReplicas().compareAndSet(availablePods, requiredPods)) {
-                        logger.info("Scaling to {} pods, total in-flight reqs {} ", requiredPods, totalInFlightRequests);
-                        scale(requiredPods);
-                    } else {
-                        logger.info("Available pods is not equal to desired replicas, dissmising scaling to {} pods, total in-flight {}", requiredPods, totalInFlightRequests);
-                    }
+                if (desiredPods > currentPods) {
+                    logger.info("Scaling to {} pods, concurrency {} ", desiredPods, panicWindowAverageConcurrency);
+                    stats.setLastScaling(now);
+                    stats.getDesiredReplicas().set(desiredPods);
+                    scale(desiredPods);
                 }
-            } else if (totalInFlightRequests == 0) {
-                var lastRequest = stats.getLastRequest();
-                var now = Instant.now();
-                var gracePeriod = parseDurationToSeconds(serverless.getSpec().getScaleToZeroGracePerdiod());
-                if (ChronoUnit.SECONDS.between(lastRequest, now) >= gracePeriod) {
-                    int oldValue = stats.getDesiredReplicas().getAndSet(0);
-                    if (oldValue != 0) {
-                        logger.info("Grace period expired, scaling down");
-                        scale(0);
+            } else {
+                if (stableWindowAverageConcurrency == 0) {
+                    double scaleToZeroWindowAverage = tail(stats.getConcurrencyValues(), parseToSeconds(serverless.getSpec().getScaleToZeroGracePerdiod()))
+                            .stream().mapToDouble(v->v).average().orElse(0);
+                    if (scaleToZeroWindowAverage == 0) {
+                        int oldValue = stats.getDesiredReplicas().getAndSet(0);
+                        if (oldValue != 0) {
+                            logger.info("Grace period expired, scaling down");
+                            stats.getDesiredReplicas().set(0);
+                            scale(0);
+                        }
+                    }
+                } else {
+                    int desiredPods = (int) Math.ceil(stableWindowAverageConcurrency / concurrencyTarget);
+                    int currentPods = stats.getDesiredReplicas().get();
+                    if (desiredPods != currentPods) {
+                        logger.info("Scaling to {} pods, concurrency {} ", desiredPods, stableWindowAverageConcurrency);
+                        stats.getDesiredReplicas().set(desiredPods);
+                        scale(desiredPods);
                     }
                 }
             }
+
+        }
+
+        private void updateStats() {
+            double average = stats.getLastConcurrencyValues().stream().mapToInt(v -> v).average().orElse(0);
+            stats.getLastConcurrencyValues().clear();
+            stats.getConcurrencyValues().add(average);
+            if (stats.getConcurrencyValues().size()>parseToSeconds(serverless.getSpec().getStableWindow())) {
+                stats.getConcurrencyValues().remove();
+            }
+        }
+
+        private void generateStats() {
+            stats.getLastConcurrencyValues().add(stats.getConcurrentRequests().get());
         }
 
         public void scale(int requiredPods) {
             vertx.runOnContext(a -> {
-//                logger.info("Scaling deployment {} to {} required pods", serverless.getStatus().getDeploymentName(), requiredPods);
                 kubernetesClient.apps().deployments()
                     .inNamespace(serverless.getMetadata().getNamespace())
                     .withName(serverless.getStatus().getDeploymentName())
@@ -249,39 +304,14 @@ public class ProxyManager {
         }
 
         public void stop() {
-            vertx.cancelTimer(jobId);
+            jobsId.forEach(vertx::cancelTimer);
         }
 
-        private long parseDurationToSeconds(String duration) {
-            Matcher digitsMatcher = Pattern.compile("\\d+").matcher(duration);
-            String digit;
-            if (digitsMatcher.find()) {
-                digit = digitsMatcher.group();
-            } else {
-                throw new IllegalArgumentException("Invalid value, no digits");
-            }
+    }
 
-            Matcher unitMatcher = Pattern.compile("[a-z]").matcher(duration);
-            String unit;
-            if (unitMatcher.find()) {
-                unit = unitMatcher.group();
-            } else {
-                throw new IllegalArgumentException("Invalid value, no unit");
-            }
-
-            long totalSeconds = 0;
-
-            if (unit.equals("s")) {
-                totalSeconds = Integer.parseInt(digit);
-            } else if (unit.equals("ms")){
-                totalSeconds = Integer.parseInt(digit) / 1000;
-            } else {
-                throw new IllegalArgumentException("Invalid value, unsupported unit");
-            }
-
-            return totalSeconds;
-        }
-
+    private enum AutoscalerWorkingMode {
+        STABLE,
+        PANIC;
     }
 
 }

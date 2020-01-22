@@ -5,8 +5,7 @@ metadata:
 spec:
   hostname: reverse-words
   port: 9999
-  in-flight-requests: 2
-  scale-to-zero-grace-period: 15s
+  container-concurrency-target: 5
   podSpec:
     containers:
     - image: quay.io/famargon/quarkus-sample-app

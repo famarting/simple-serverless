@@ -10,8 +10,9 @@ import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.Watcher;
+import io.vertx.core.Vertx;
 
-public abstract class GenericResourceCache <T extends HasMetadata> implements Watcher<T>{
+public abstract class GenericResourceCache <T extends HasMetadata> extends GenericSubscriptionService<T> implements Watcher<T>{
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass().getName());
 
@@ -19,7 +20,8 @@ public abstract class GenericResourceCache <T extends HasMetadata> implements Wa
 
     protected KubernetesClient kubernetesClient;
 
-    public GenericResourceCache(KubernetesClient kubernetesClient) {
+    public GenericResourceCache(KubernetesClient kubernetesClient, Vertx vertx) {
+        super(vertx);
         this.kubernetesClient = kubernetesClient;
     }
 

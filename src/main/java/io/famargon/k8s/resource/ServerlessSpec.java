@@ -18,10 +18,16 @@ public class ServerlessSpec {
     private String hostname;
     private int port;
     private PodSpec podSpec;
+    @JsonProperty("container-concurrency-target")
+    private Integer concurrencyTarget = 100;
+    @JsonProperty("panic-window")
+    private String panicWindow = "6s";
+    @JsonProperty("stable-window")
+    private String stableWindow = "60s";
     @JsonProperty("scale-to-zero-grace-period")
     private String scaleToZeroGracePerdiod = "30s";
-    @JsonProperty("in-flight-requests")
-    private Integer inFlightRequestsPerPod = 100;
+    @JsonProperty("tick-interval")
+    private String tickInterval = "2s";
 
     /**
      * @return the podSpec
@@ -73,12 +79,36 @@ public class ServerlessSpec {
         this.scaleToZeroGracePerdiod = scaleToZeroGracePerdiod;
     }
 
-    public Integer getInFlightRequestsPerPod() {
-        return inFlightRequestsPerPod;
+    public Integer getConcurrencyTarget() {
+        return concurrencyTarget;
     }
 
-    public void setInFlightRequestsPerPod(Integer inFlightRequestsPerPod) {
-        this.inFlightRequestsPerPod = inFlightRequestsPerPod;
+    public void setConcurrencyTarget(Integer concurrencyTarget) {
+        this.concurrencyTarget = concurrencyTarget;
+    }
+
+    public String getPanicWindow() {
+        return panicWindow;
+    }
+
+    public void setPanicWindow(String panicWindow) {
+        this.panicWindow = panicWindow;
+    }
+
+    public String getStableWindow() {
+        return stableWindow;
+    }
+
+    public void setStableWindow(String stableWindow) {
+        this.stableWindow = stableWindow;
+    }
+
+    public String getTickInterval() {
+        return tickInterval;
+    }
+
+    public void setTickInterval(String tickInterval) {
+        this.tickInterval = tickInterval;
     }
 
 }

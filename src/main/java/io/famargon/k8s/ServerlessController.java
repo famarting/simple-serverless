@@ -1,6 +1,5 @@
 package io.famargon.k8s;
 
-import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -19,26 +18,29 @@ import io.fabric8.kubernetes.client.Watcher;
 import io.fabric8.kubernetes.client.dsl.NonNamespaceOperation;
 import io.fabric8.kubernetes.client.dsl.Resource;
 import io.fabric8.kubernetes.internal.KubernetesDeserializer;
+import io.famargon.k8s.cache.GenericSubscriptionService;
 import io.famargon.k8s.resource.DoneableServerless;
 import io.famargon.k8s.resource.Serverless;
 import io.famargon.k8s.resource.ServerlessCrd;
 import io.famargon.k8s.resource.ServerlessList;
 import io.famargon.k8s.resource.ServerlessStatus;
+import io.vertx.core.Vertx;
 
 /**
  * ServerlessController
  */
-public class ServerlessController implements Watcher<Serverless> {
+public class ServerlessController extends GenericSubscriptionService<Serverless> implements Watcher<Serverless> {
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass().getName());
 
     private String namespace = SimpleServerlessOperator.NAMESPACE;
     private KubernetesClient kubernetesClient;
-    private Map<String, Serverless> cache;
+    private ServerlessService serverlessService;
 
-    public ServerlessController(KubernetesClient kubernetesClient, Map<String, Serverless> cache) {
+    public ServerlessController(KubernetesClient kubernetesClient, Vertx vertx, ServerlessService serverlessService) {
+        super(vertx);
         this.kubernetesClient = kubernetesClient;
-        this.cache = cache;
+        this.serverlessService = serverlessService;
     }
 
     public void start() {
@@ -66,10 +68,10 @@ public class ServerlessController implements Watcher<Serverless> {
 
     private void handleDeletion(Serverless resource) {
         logger.info("Handling delete {} {}", resource.getMetadata().getName(), resource.getStatus());
+        serverlessService.delete(resource);
         String suid = resource.getStatus().getSuid();
         kubernetesClient.apps().deployments().inNamespace(namespace).withLabel("suid", suid).delete();
         kubernetesClient.services().inNamespace(namespace).withLabel("suid", suid).delete();
-        cache.remove(resource.getSpec().getHostname());
     }
 
 
@@ -150,7 +152,8 @@ public class ServerlessController implements Watcher<Serverless> {
             getServerlessCrdClient()
                 .createOrReplace(resource);
 
-            cache.put(resource.getSpec().getHostname(), resource);
+            serverlessService.create(resource);
+
             logger.info("Serverless with host {} successfully {}", resource.getSpec().getHostname(), action);
         }
 
